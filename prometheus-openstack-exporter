@@ -8,13 +8,14 @@ Authors:
   Jacek Nykis <jacek.nykis@canonical.com>
   Laurent Sesques <laurent.sesques@canonical.com>
 
-Copyright 2017 IRISA
+Copyright 2017-2018 IRISA
 Authors:
   Olivier Sallou <olivier.sallou@irisa.fr>
 Modifications:
   Use API instead of python clients
   Add rabbitmq checks
   Add cinder metrics
+  Add manila metrics
 
 
 
@@ -44,9 +45,14 @@ import json
 import subprocess
 import re
 import sys
-from BaseHTTPServer import BaseHTTPRequestHandler
-from BaseHTTPServer import HTTPServer
-from SocketServer import ForkingMixIn
+if (sys.version_info > (3, 0)):
+    from http.server import BaseHTTPRequestHandler
+    from http.server import HTTPServer
+    from socketserver import ForkingMixIn
+else:
+    from BaseHTTPServer import BaseHTTPRequestHandler
+    from BaseHTTPServer import HTTPServer
+    from SocketServer import ForkingMixIn
 from prometheus_client import CollectorRegistry, generate_latest, Gauge, CONTENT_TYPE_LATEST
 from netaddr import iter_iprange
 
@@ -121,6 +127,8 @@ class DataGatherer(Thread):
             for endpoint in res['endpoints']:
                 # Get public interfaces only
                 if endpoint['interface'] == 'public':
+                    if endpoint['url'].startswith('http://'):
+                        continue
                     o = urlparse(endpoint['url'])
                     data={'url': o.scheme+'://'+o.netloc, 'name': services[endpoint['service_id']]}
                     endpoints.append(data)
@@ -134,7 +142,7 @@ class DataGatherer(Thread):
                 else:
                     result[endpoint['name']] = 1
             except Exception as e:
-                    print('Failed to contact endpoint: '+str(e))
+                    print('Failed to contact endpoint %s: %s' % (endpoint['url'], str(e)))
                     result[endpoint['name']] = 0
         return result
 
@@ -152,7 +160,8 @@ class DataGatherer(Thread):
                 "auth_url": env['OS_AUTH_URL'],
                 "compute_url": env['OS_COMPUTE_URL'],
                 "network_url": env['OS_NETWORK_URL'],
-                'cinder_url': env['OS_CINDER_URL']
+                'cinder_url': env['OS_CINDER_URL'],
+                'share_url': env['OS_SHARE_URL']
             }
             try:
                 token = self.__get_token(creds)
@@ -168,6 +177,7 @@ class DataGatherer(Thread):
                 prodstack['ports'] = []
                 prodstack['floatingips'] = []
                 prodstack['instances'] = []
+                prodstack['shares'] = []
                 prodstack['endpoints'] = self.check_endpoints(creds, token)
                 res = self.openstack_query(creds['auth_url'], '/projects',token)
                 if res and res['projects']:
@@ -203,13 +213,30 @@ class DataGatherer(Thread):
                     prodstack['floatingips'] = res['hypervisors']
 
 
+
+                for tenant in prodstack['tenants']:
+                    try:
+                        res = self.openstack_query(creds['share_url'] + creds['tenant_id'], '/shares/detail?all_tenants=1&project_id='+tenant['id'],token)
+                        if res and res['shares']:
+                            for share in res['shares']:
+                                prodstack['shares'].append({
+                                        'tenant_id': tenant['id'],
+                                        'size': share['size'],
+                                        'voltype': share['share_proto']
+                                })
+                    except Exception as e:
+                        print('Could not get share info for project ' + tenant['name'] + ': ' + str(e))                    
+
                 # Instance info is very heavy, disable until we merge this bit with pantomath
                 prodstack['instances'] = []
                 prodstack['cinder_volumes'] = []
+                prodstack['cinder_capacity'] = []
 
                 res = self.openstack_query(creds['compute_url'] + creds['tenant_id'], '/servers/detail?all_tenants=1',token)
                 if res and res['servers']:
                     for instance in res['servers']:
+                        if instance['tenant_id'] not in prodstack['project_domain']:
+                            continue
                         new_instance = {
                                         'tenant_id': instance['tenant_id'],
                                         'domain_id': prodstack['project_domain'][instance['tenant_id']],
@@ -231,6 +258,17 @@ class DataGatherer(Thread):
                                         'size': vol['size'],
                                         'voltype': vol['volume_type']
                                 })
+                        res = self.openstack_query(creds['cinder_url'] + creds['tenant_id'], '/scheduler-stats/get_pools?detail=true',token)
+                        pools = []
+                        if res and res['pools']:
+                            for pool in res['pools']:
+                                if pool['name'] not in pools:
+                                    pools.append(pool['name'])
+                                    prodstack['cinder_capacity'].append({
+                                        'pool': pool['name'],
+                                        'capacity': pool['capabilities']['total_capacity_gb'],
+                                        'free': pool['capabilities']['free_capacity_gb']
+                                    })
                     except Exception as e:
                         print('Could not get volume info for project ' + tenant['name'] + ': ' + str(e))
 
@@ -471,6 +509,26 @@ class Nova():
         for i in self.prodstack['cinder_volumes']:
             tenant = self.tenant_map[i['tenant_id']]
             cinder_volumes.labels(config['cloud'], tenant, i['voltype']).inc(i['size'])
+        if self.prodstack.get('cinder_capacity', None):
+            cinder_capacity = Gauge('cinder_capacity',
+                            'Cinder pools total capacity',
+                            ['cloud', 'pool'], registry=self.registry)          
+            for i in self.prodstack['cinder_capacity']:
+                cinder_capacity.labels(config['cloud'], i['pool']).set(i['capacity'])
+            cinder_free = Gauge('cinder_free',
+                            'Cinder pools free capacity',
+                            ['cloud', 'pool'], registry=self.registry)          
+            for i in self.prodstack['cinder_capacity']:
+                cinder_free.labels(config['cloud'], i['pool']).set(i['free'])
+
+    def gen_share_stats(self):
+        labels = ['cloud', 'tenant', 'voltype']
+        share_volumes = Gauge('share_volumes',
+                          'Manila volumes metrics',
+                          labels, registry=self.registry)
+        for i in self.prodstack['shares']:
+            tenant = self.tenant_map[i['tenant_id']]
+            share_volumes.labels(config['cloud'], tenant, i['voltype']).inc(i['size'])
 
     def gen_endpoints_stats(self):
         labels = ['cloud', 'endpoint']
@@ -490,6 +548,7 @@ class Nova():
         self.gen_overcommit_stats()
         self.gen_rabbitmq_stats()
         self.gen_cinder_stats()
+        self.gen_share_stats()
         self.gen_endpoints_stats()
         return generate_latest(self.registry)
 
@@ -570,21 +629,36 @@ class OpenstackExporterHandler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header('Content-Type', CONTENT_TYPE_LATEST)
                 self.end_headers()
-                self.wfile.write(output)
+                if (sys.version_info > (3, 0)):
+                    self.wfile.write(output.encode())
+                else:
+                    self.wfile.write(output)
             except:
                 self.send_response(500)
                 self.end_headers()
-                self.wfile.write(traceback.format_exc())
+                if (sys.version_info > (3, 0)):
+                    self.wfile.write(traceback.format_exc().encode())
+                else:
+                    self.wfile.write(traceback.format_exc())
         elif url.path == '/':
             self.send_response(200)
             self.end_headers()
-            self.wfile.write("""<html>
-            <head><title>OpenStack Exporter</title></head>
-            <body>
-            <h1>OpenStack Exporter</h1>
-            <p>Visit <code>/metrics</code> to use.</p>
-            </body>
-            </html>""")
+            if (sys.version_info > (3, 0)):
+                self.wfile.write(b"""<html>
+                <head><title>OpenStack Exporter</title></head>
+                <body>
+                <h1>OpenStack Exporter</h1>
+                <p>Visit <code>/metrics</code> to use.</p>
+                </body>
+                </html>""")
+            else:
+                self.wfile.write("""<html>
+                <head><title>OpenStack Exporter</title></head>
+                <body>
+                <h1>OpenStack Exporter</h1>
+                <p>Visit <code>/metrics</code> to use.</p>
+                </body>
+                </html>""")
         else:
             self.send_response(404)
             self.end_headers()
